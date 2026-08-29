@@ -1,5 +1,9 @@
 {
-  "rewrites": [
-    { "source": "/", "destination": "/dr-simulation/dashboard.html" }
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/dr-simulation/dashboard.html",
+      "permanent": false
+    }
   ]
 }
