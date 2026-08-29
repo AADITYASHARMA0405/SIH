@@ -1048,7 +1048,7 @@ function runSimulink() {
     for(let i=1;i<5;i++){ ctx.beginPath(); ctx.moveTo(0, i*60); ctx.lineTo(cv.width, i*60); ctx.stroke(); }
     
     if(hist.length > 1) {
-      const getX = (i) => cv.width - ((hist.length - 1 - i) / 49) * cv.width;
+      const getX = (i) => (i / 49) * cv.width;
       
       const grad = ctx.createLinearGradient(0,0,0,cv.height);
       grad.addColorStop(0, 'rgba(37, 99, 235, 0.15)'); grad.addColorStop(1, 'rgba(37, 99, 235, 0)');
