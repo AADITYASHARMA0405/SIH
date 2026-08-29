@@ -727,6 +727,8 @@ body {
   </div>
 </div>
 
+<button id="stopDemoBtn" class="btn btn-primary" onclick="stopDemo()" style="display:none; position:fixed; bottom:30px; right:30px; z-index:1000; font-size:16px; padding: 14px 28px; background:var(--accent-red); box-shadow:0 4px 12px rgba(220, 38, 38, 0.4); color:#fff;"><i data-lucide="pause-circle"></i> Pause Auto-Demo</button>
+
 <script>
 lucide.createIcons();
 
@@ -1069,49 +1071,65 @@ function runSimulink() {
   }, 100);
 }
 
+let demoTimeouts = [];
+
+function stopDemo() {
+  demoTimeouts.forEach(clearTimeout);
+  demoTimeouts = [];
+  const stopBtn = document.getElementById('stopDemoBtn');
+  if (stopBtn) stopBtn.style.display = 'none';
+}
+
 function startSlideshow() {
+  const stopBtn = document.getElementById('stopDemoBtn');
+  if (stopBtn) stopBtn.style.display = 'inline-flex';
+  
+  demoTimeouts.forEach(clearTimeout);
+  demoTimeouts = [];
+
   // Step 1: Capture
   switchTab('capture');
   
   // Step 2: Quality
-  setTimeout(() => {
+  demoTimeouts.push(setTimeout(() => {
     selectImage('moderate'); // This naturally triggers the overlay and quality tab
     
     // Step 3: Enhance
-    setTimeout(() => {
+    demoTimeouts.push(setTimeout(() => {
       switchTab('enhance');
       
       // Step 4: Segment
-      setTimeout(() => {
+      demoTimeouts.push(setTimeout(() => {
         switchTab('segment');
         
         // Step 5: Classify
-        setTimeout(() => {
+        demoTimeouts.push(setTimeout(() => {
           switchTab('classify');
           
           // Step 6: Explainability
-          setTimeout(() => {
+          demoTimeouts.push(setTimeout(() => {
             switchTab('gradcam');
             
             // Step 7: Analytics
-            setTimeout(() => {
+            demoTimeouts.push(setTimeout(() => {
               switchTab('performance');
               
               // Step 8: Report
-              setTimeout(() => {
+              demoTimeouts.push(setTimeout(() => {
                 switchTab('report');
                 
                 // Step 9: Simulation
-                setTimeout(() => {
+                demoTimeouts.push(setTimeout(() => {
                   switchTab('simulink');
-                }, 4000);
-              }, 4000);
-            }, 5000);
-          }, 4500);
-        }, 4000);
-      }, 4000);
-    }, 5500); // wait for quality anim (1200ms overlay + 3000ms anim)
-  }, 2500);
+                  if (stopBtn) stopBtn.style.display = 'none';
+                }, 4000));
+              }, 4000));
+            }, 5000));
+          }, 4500));
+        }, 4000));
+      }, 4000));
+    }, 5500)); // wait for quality anim (1200ms overlay + 3000ms anim)
+  }, 2500));
 }
 
 switchTab('overview');
