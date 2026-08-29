@@ -1,0 +1,1240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RetinaAI Video Generator</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#000;overflow:hidden;font-family:'Segoe UI',sans-serif;color:#fff;}
+canvas{display:block;}
+#status{position:fixed;top:10px;left:10px;background:rgba(0,0,0,0.8);padding:10px 20px;border-radius:8px;font-size:14px;z-index:100;color:#06b6d4;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="status">Loading assets...</div>
+<script>
+const C=document.getElementById('c'),X=C.getContext('2d');
+const W=1920,H=1080;
+C.width=W;C.height=H;
+C.style.width='100vw';C.style.height='100vh';
+
+let frame=0,scene=0,sceneFrame=0,recording=false,recorder,chunks=[];
+
+// Images
+const doctorImg=new Image();doctorImg.src='doctor_fundoscopy.png';
+const fundusImg=new Image();fundusImg.src='fundus_moderate.jpg';
+const fundusNorm=new Image();fundusNorm.src='fundus_normal.jpg';
+const fundusSev=new Image();fundusSev.src='fundus_severe.jpg';
+const confMatImg=new Image();confMatImg.src='confusion_matrix.png';
+const rocImg=new Image();rocImg.src='roc_curve.png';
+const trainImg=new Image();trainImg.src='training_history.png';
+
+let loadedCount=0;
+const totalImages=7;
+[doctorImg,fundusImg,fundusNorm,fundusSev,confMatImg,rocImg,trainImg].forEach(img=>{
+  img.onload=()=>{loadedCount++;if(loadedCount>=totalImages)startGeneration();};
+  img.onerror=()=>{loadedCount++;if(loadedCount>=totalImages)startGeneration();};
+});
+
+// Scene durations (frames at 60fps)
+// Scene 0: Fundoscopy 180f=3s | Scene 1: Acquisition 300f=5s | Scene 2: Track 300f=5s
+// Scene 3: Interpretability 300f=5s | Scene 4: Simulink+Report 300f=5s | Scene 5: Closing 180f=3s
+const sceneDurations=[180,300,300,300,300,180];
+const totalFrames=sceneDurations.reduce((a,b)=>a+b,0);
+
+// ─── UTILITIES ───
+function ease(t){return t<0.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;}
+function easeOut(t){return 1-Math.pow(1-Math.max(0,Math.min(1,t)),3);}
+function lerp(a,b,t){return a+(b-a)*Math.max(0,Math.min(1,t));}
+
+function fadeText(text,x,y,size,color,alpha,align='center',weight='600',font='Segoe UI'){
+  if(alpha<=0)return;
+  X.save();X.globalAlpha=Math.max(0,Math.min(1,alpha));
+  X.font=`${weight} ${size}px '${font}',sans-serif`;
+  X.fillStyle=color;X.textAlign=align;X.textBaseline='middle';
+  X.fillText(text,x,y);X.restore();
+}
+
+function drawGlow(x,y,r,color,alpha=0.3){
+  const g=X.createRadialGradient(x,y,0,x,y,r);
+  g.addColorStop(0,color.replace(')',`,${alpha})`).replace('rgb','rgba'));
+  g.addColorStop(1,'rgba(0,0,0,0)');
+  X.fillStyle=g;X.fillRect(x-r,y-r,r*2,r*2);
+}
+
+function roundRect(x,y,w,h,r){
+  X.beginPath();X.moveTo(x+r,y);X.lineTo(x+w-r,y);X.quadraticCurveTo(x+w,y,x+w,y+r);
+  X.lineTo(x+w,y+h-r);X.quadraticCurveTo(x+w,y+h,x+w-r,y+h);X.lineTo(x+r,y+h);
+  X.quadraticCurveTo(x,y+h,x,y+h-r);X.lineTo(x,y+r);X.quadraticCurveTo(x,y,x+r,y);X.closePath();
+}
+
+function drawGlass(x,y,w,h,r=16,alpha=1,bc='rgba(255,255,255,0.08)',bg='rgba(15,23,42,0.6)'){
+  X.save();X.globalAlpha=Math.max(0,alpha);
+  X.fillStyle=bg;roundRect(x,y,w,h,r);X.fill();
+  X.strokeStyle=bc;X.lineWidth=1.5;roundRect(x,y,w,h,r);X.stroke();X.restore();
+}
+
+function drawBar(x,y,w,h,fill,color,bg='rgba(255,255,255,0.06)'){
+  X.fillStyle=bg;roundRect(x,y,w,h,h/2);X.fill();
+  if(fill>0){
+    const grd=X.createLinearGradient(x,y,x+w*fill,y);
+    grd.addColorStop(0,color);grd.addColorStop(1,color.replace('1)','0.6)'));
+    X.fillStyle=grd;roundRect(x,y,w*fill,h,h/2);X.fill();
+  }
+}
+
+function drawCircleFundus(x,y,r,img,alpha=1){
+  if(alpha<=0||!img.complete||img.naturalWidth<=0)return;
+  X.save();X.globalAlpha=Math.max(0,alpha);
+  X.beginPath();X.arc(x,y,r,0,Math.PI*2);X.clip();
+  X.drawImage(img,x-r,y-r,r*2,r*2);
+  X.restore();
+  X.save();X.globalAlpha=Math.max(0,alpha)*0.5;
+  X.strokeStyle='rgba(6,182,212,0.4)';X.lineWidth=3;
+  X.beginPath();X.arc(x,y,r,0,Math.PI*2);X.stroke();X.restore();
+}
+
+function drawFlowArrow(x1,y1,x2,y2,alpha,color='#06b6d4'){
+  if(alpha<=0)return;
+  X.save();X.globalAlpha=alpha;
+  X.strokeStyle=color;X.lineWidth=2.5;X.setLineDash([10,8]);X.lineDashOffset=-frame*2;
+  X.beginPath();X.moveTo(x1,y1);X.lineTo(x2,y2);X.stroke();X.setLineDash([]);
+  const a=Math.atan2(y2-y1,x2-x1);
+  X.fillStyle=color;X.beginPath();
+  X.moveTo(x2,y2);X.lineTo(x2-14*Math.cos(a-0.4),y2-14*Math.sin(a-0.4));
+  X.lineTo(x2-14*Math.cos(a+0.4),y2-14*Math.sin(a+0.4));X.fill();
+  const prog=(frame*0.02)%1;
+  const dx=lerp(x1,x2,prog),dy=lerp(y1,y2,prog);
+  X.fillStyle=color;X.shadowColor=color;X.shadowBlur=8;
+  X.beginPath();X.arc(dx,dy,4,0,7);X.fill();X.shadowBlur=0;
+  X.restore();
+}
+
+function drawPulseRing(x,y,r,color,alpha=0.3){
+  const p=(frame%90)/90;
+  X.save();X.globalAlpha=alpha*(1-p);
+  X.strokeStyle=color;X.lineWidth=2;
+  X.beginPath();X.arc(x,y,r+p*40,0,Math.PI*2);X.stroke();X.restore();
+}
+
+function drawBg(){
+  // Dark blue gradient background
+  const bg=X.createRadialGradient(W*0.5,H*0.5,0,W*0.5,H*0.5,W*0.7);
+  bg.addColorStop(0,'#0c1929');bg.addColorStop(1,'#030712');
+  X.fillStyle=bg;X.fillRect(0,0,W,H);
+  // Subtle ambient glows
+  drawGlow(W*0.15,H*0.25,400,'rgb(6,50,100)',0.15);
+  drawGlow(W*0.85,H*0.75,350,'rgb(6,80,120)',0.1);
+  drawGlow(W*0.5,H*0.5,500,'rgb(10,30,60)',0.08);
+  // Background particles (subtle)
+  for(let i=0;i<30;i++){
+    const px=((frame*0.3+i*67)%W);
+    const py=((frame*0.2+i*43)%H);
+    X.save();X.globalAlpha=0.15+Math.sin(frame*0.02+i)*0.08;
+    X.fillStyle='#1e3a5f';X.beginPath();X.arc(px,py,1.5,0,7);X.fill();X.restore();
+  }
+}
+
+// ─── SCENE 0: FUNDOSCOPY INTRO (Kept same concept) ───
+function scene0_doctor(t){
+  const zoomStart=0.5,zoomEnd=0.8,flashStart=0.85;
+  
+  if(doctorImg.complete&&doctorImg.naturalWidth>0){
+    const imgAspect=doctorImg.naturalWidth/doctorImg.naturalHeight;
+    let baseW,baseH;
+    if(W/H>imgAspect){baseH=H*0.82;baseW=baseH*imgAspect;}
+    else{baseW=W*0.55;baseH=baseW/imgAspect;}
+    
+    let scale=1,offsetX=0,offsetY=0,imgAlpha=1;
+    if(t>zoomStart&&t<=zoomEnd){
+      const zp=easeOut((t-zoomStart)/(zoomEnd-zoomStart));
+      scale=1+zp*3;offsetY=baseH*0.28*zp;
+    }else if(t>zoomEnd){
+      scale=4;offsetY=baseH*0.28;
+      imgAlpha=Math.max(0,1-(t-flashStart)*8);
+    }
+    
+    const revealT=easeOut(Math.min(1,t*2.5));
+    const imgX=W/2-baseW/2+offsetX;
+    const imgY=H/2-baseH/2+25+offsetY;
+    
+    drawGlow(W/2,H/2,Math.max(baseW,baseH)*0.8,'rgb(6,182,212)',0.08*revealT);
+    
+    X.save();
+    X.globalAlpha=Math.min(revealT,imgAlpha);
+    X.translate(W/2,H/2);X.scale(scale,scale);X.translate(-W/2,-H/2);
+    roundRect(imgX,imgY,baseW,baseH,24/scale);X.clip();
+    X.drawImage(doctorImg,imgX,imgY,baseW,baseH);
+    X.restore();
+    
+    if(t<zoomStart+0.1){
+      X.save();X.globalAlpha=revealT*0.5*(1-easeOut((t-zoomStart)*5));
+      X.strokeStyle='rgba(6,182,212,0.3)';X.lineWidth=2;
+      roundRect(imgX,imgY,baseW,baseH,24);X.stroke();X.restore();
+    }
+    
+    if(t>0.15&&t<zoomEnd){
+      const slitX=W/2,slitY=H/2-baseH*0.05;
+      const pa=easeOut((t-0.15)*3)*(1-easeOut((t-zoomStart)*3));
+      drawPulseRing(slitX,slitY,25,'#06b6d4',0.2*pa);
+      drawPulseRing(slitX,slitY,50,'#3b82f6',0.12*pa);
+      
+      if(t>0.25){
+        const aa=easeOut((t-0.25)*3)*pa;
+        X.save();X.globalAlpha=aa;X.strokeStyle='rgba(6,182,212,0.5)';X.lineWidth=1;X.setLineDash([4,4]);
+        X.beginPath();X.moveTo(slitX+10,slitY-20);X.lineTo(slitX+150,slitY-70);X.stroke();X.setLineDash([]);
+        X.restore();
+        drawGlass(slitX+150,slitY-100,220,55,12,aa,'rgba(6,182,212,0.3)','rgba(6,182,212,0.06)');
+        fadeText('Slit-lamp Biomicroscope',slitX+260,slitY-72,16,'#67e8f9',aa);
+      }
+    }
+    
+    if(t>zoomStart&&t<flashStart){
+      const ci=easeOut((t-zoomStart)*3);
+      const blink=Math.sin(frame*0.2)>0?1:0.4;
+      X.save();X.globalAlpha=ci*blink;
+      X.fillStyle='#ef4444';X.beginPath();X.arc(W-100,70,8,0,7);X.fill();X.restore();
+      fadeText('● REC',W-70,70,16,'#ef4444',ci*blink,'left','700');
+      fadeText('Capturing retinal image…',W/2,H-60,20,'#67e8f9',ci);
+    }
+  }
+  
+  const titleFade=t<zoomStart?1:Math.max(0,1-(t-zoomStart)*5);
+  const ta=easeOut(Math.min(1,(t-0.03)*2.5))*titleFade;
+  fadeText('Fundoscopy Examination',W/2,65,40,'#f8fafc',ta,'center','700');
+  fadeText('The ophthalmologist examines the patient\'s retina through a slit-lamp biomicroscope',W/2,110,18,'#94a3b8',ta*0.8,'center','400');
+  
+  if(t>0.3&&t<zoomStart){
+    const ba=easeOut((t-0.3)*3);
+    const steps=['Capture','Quality','CLAHE','Segment','Classify','Explain','Report'];
+    const colors=['#3b82f6','#10b981','#8b5cf6','#06b6d4','#f97316','#ec4899','#3b82f6'];
+    const totalSW=steps.length*110+(steps.length-1)*15;
+    const startX=W/2-totalSW/2;
+    steps.forEach((s,i)=>{
+      const sa=easeOut((t-0.3-i*0.015)*4)*ba;
+      const sx=startX+i*125+55;
+      drawGlass(sx-50,H-100,100,42,20,sa,`${colors[i]}44`,`${colors[i]}0D`);
+      fadeText(s,sx,H-78,13,colors[i],sa,'center','600');
+      if(i<steps.length-1){
+        X.save();X.globalAlpha=sa*0.4;X.strokeStyle='rgba(255,255,255,0.3)';X.lineWidth=1;
+        X.beginPath();X.moveTo(sx+52,H-78);X.lineTo(sx+73,H-78);X.stroke();X.restore();
+      }
+    });
+  }
+  
+  if(t>flashStart){
+    const fp=(t-flashStart)/(1-flashStart);
+    X.fillStyle=`rgba(255,255,255,${easeOut(fp)})`;X.fillRect(0,0,W,H);
+  }
+}
+
+// ─── SCENE 1: MODULE 1 — ACQUISITION TO PREPROCESSING ───
+function scene1_acquisition(t){
+  // White flash fade-out
+  if(t<0.08){X.fillStyle=`rgba(255,255,255,${1-easeOut(t*12)})`;X.fillRect(0,0,W,H);}
+  
+  const ha=easeOut(Math.min(1,t*3));
+  
+  // Module title
+  fadeText('Module 1: Acquisition to Preprocessing Flow',W/2,50,32,'#f8fafc',ha,'center','700');
+  
+  // Main container glass panel
+  drawGlass(40,80,W-80,H-120,20,ha*0.3,'rgba(6,182,212,0.15)','rgba(10,25,50,0.4)');
+  
+  // "Image Quality Assessment" box at top center
+  if(t>0.05){
+    const qa=easeOut((t-0.05)*3);
+    drawGlass(W*0.3,100,W*0.4,50,12,qa,'rgba(6,182,212,0.4)','rgba(6,182,212,0.12)');
+    fadeText('Image Quality Assessment',W/2,125,20,'#67e8f9',qa,'center','700');
+    // Down arrow from quality assessment
+    drawFlowArrow(W/2,150,W/2,200,qa*0.6,'#06b6d4');
+  }
+  
+  // Left: Large circular fundus image with scanning line
+  const fx=320,fy=500,fr=200;
+  if(t>0.08){
+    const fa=easeOut((t-0.08)*3);
+    drawCircleFundus(fx,fy,fr*fa,fundusImg,fa);
+    
+    // Down arrow from quality to fundus
+    drawFlowArrow(W*0.35,150,fx,fy-fr-20,fa*0.5,'#06b6d4');
+    
+    // Scanning highlight line
+    if(t<0.5){
+      const scanY=fy-fr+(t/0.5)*fr*2;
+      X.save();X.globalAlpha=0.7*fa;X.strokeStyle='#06b6d4';X.lineWidth=3;
+      X.beginPath();X.arc(fx,fy,fr,0,Math.PI*2);X.clip();
+      X.beginPath();X.moveTo(fx-fr,scanY);X.lineTo(fx+fr,scanY);X.stroke();
+      const sGrd=X.createLinearGradient(fx,scanY-40,fx,scanY);
+      sGrd.addColorStop(0,'rgba(6,182,212,0)');sGrd.addColorStop(1,'rgba(6,182,212,0.2)');
+      X.fillStyle=sGrd;X.fillRect(fx-fr,scanY-40,fr*2,40);
+      X.restore();
+    }
+    
+    // Quality check marks below fundus
+    if(t>0.2){
+      const checks=[{l:'Focus',d:0.2},{l:'Illumination',d:0.28},{l:'FOV',d:0.36}];
+      checks.forEach((c,i)=>{
+        const ca=easeOut((t-c.d)*4);
+        const cy=fy+fr*0.5+i*45;
+        const cx2=fx-70;
+        fadeText('✓',cx2,cy,24,'#10b981',ca,'center','700');
+        fadeText(c.l,cx2+30,cy,18,'#e2e8f0',ca,'left','600');
+      });
+    }
+  }
+  
+  // Center: Processing device / Hybrid DL Track visual
+  if(t>0.3){
+    const da=easeOut((t-0.3)*2.5);
+    const dx=W*0.5,dy=450;
+    
+    // Arrow from fundus to processing
+    drawFlowArrow(fx+fr+20,fy,dx-100,dy,da*0.5,'#06b6d4');
+    
+    // Processing "device" — stylized rectangle with scan lines
+    drawGlass(dx-90,dy-120,180,240,16,da,'rgba(6,182,212,0.3)','rgba(8,20,45,0.85)');
+    
+    // Inner fundus (being processed)
+    if(fundusImg.complete&&fundusImg.naturalWidth>0){
+      X.save();X.globalAlpha=da*0.7;
+      roundRect(dx-60,dy-90,120,120,10);X.clip();
+      X.drawImage(fundusImg,dx-60,dy-90,120,120);
+      // Scan overlay
+      X.globalCompositeOperation='screen';
+      const scanGrd=X.createLinearGradient(dx-60,dy-90,dx+60,dy+30);
+      scanGrd.addColorStop(0,'rgba(6,182,212,0)');
+      scanGrd.addColorStop(0.4+Math.sin(frame*0.05)*0.1,'rgba(6,182,212,0.3)');
+      scanGrd.addColorStop(1,'rgba(6,182,212,0)');
+      X.fillStyle=scanGrd;X.fillRect(dx-60,dy-90,120,120);
+      X.restore();
+    }
+    
+    // Data streams (vertical lines below device)
+    for(let i=0;i<8;i++){
+      const lx=dx-35+i*10;
+      const la=da*0.4*Math.abs(Math.sin(frame*0.1+i));
+      X.save();X.globalAlpha=la;X.strokeStyle='#06b6d4';X.lineWidth=1.5;
+      X.beginPath();X.moveTo(lx,dy+40);X.lineTo(lx,dy+80);X.stroke();X.restore();
+    }
+    
+    // "Hybrid DL Track" label
+    drawGlass(dx-80,dy+90,160,36,18,da,'rgba(16,185,129,0.5)','rgba(16,185,129,0.12)');
+    fadeText('Hybrid DL Track',dx,dy+108,14,'#10b981',da,'center','700');
+    
+    // Down arrow
+    if(t>0.5){
+      drawFlowArrow(dx,dy+130,dx,dy+180,easeOut((t-0.5)*3)*0.5,'#10b981');
+      fadeText('Denoising Preprocessing to Processing',dx,dy+200,14,'#94a3b8',easeOut((t-0.55)*3)*0.6);
+    }
+  }
+  
+  // Right: Preprocessing sliders
+  if(t>0.4){
+    const sa=easeOut((t-0.4)*2.5);
+    const sx=W*0.72,sy=220;
+    
+    // Arrow from quality assessment to sliders
+    drawFlowArrow(W*0.65,150,sx,sy-20,sa*0.5,'#06b6d4');
+    
+    drawGlass(sx-20,sy,W*0.25,300,16,sa,'rgba(255,255,255,0.06)','rgba(15,23,42,0.7)');
+    fadeText('Module 1',sx+W*0.125-20,sy+30,22,'#f8fafc',sa,'center','700');
+    
+    // CLAHE slider
+    const sliders=[
+      {l:'CLAHE',v:100,pct:1.0,d:0.45,c:'#06b6d4'},
+      {l:'Denoising',v:0,pct:0.0,d:0.52,c:'#06b6d4'},
+      {l:'Enhancement',v:50,pct:0.5,d:0.59,c:'#06b6d4'}
+    ];
+    sliders.forEach((sl,i)=>{
+      const sla=easeOut((t-sl.d)*3);
+      const sly=sy+80+i*75;
+      fadeText(sl.l,sx,sly,16,'#e2e8f0',sla,'left','600');
+      fadeText(String(sl.v)+(sl.v===100?'%':''),sx+W*0.25-40,sly,16,'#f8fafc',sla,'right','700');
+      // Slider track
+      const trackX=sx,trackY=sly+25,trackW=W*0.21,trackH=8;
+      X.save();X.globalAlpha=sla;
+      X.fillStyle='rgba(255,255,255,0.08)';roundRect(trackX,trackY,trackW,trackH,4);X.fill();
+      const fillW=trackW*easeOut((t-sl.d-0.05)*2)*sl.pct;
+      if(fillW>0){
+        X.fillStyle=sl.c;roundRect(trackX,trackY,fillW,trackH,4);X.fill();
+      }
+      // Slider knob
+      const knobX=trackX+fillW;
+      X.fillStyle='#fff';X.shadowColor=sl.c;X.shadowBlur=8;
+      X.beginPath();X.arc(knobX,trackY+4,8,0,7);X.fill();X.shadowBlur=0;
+      X.restore();
+    });
+  }
+  
+  // Sparkle decoration (bottom right)
+  if(t>0.6){
+    const spa=easeOut((t-0.6)*2);
+    const spx=W-120,spy=H-120;
+    const spSize=20+Math.sin(frame*0.08)*5;
+    X.save();X.globalAlpha=spa*0.6;X.strokeStyle='#e2e8f0';X.lineWidth=2;
+    X.beginPath();X.moveTo(spx-spSize,spy);X.lineTo(spx+spSize,spy);X.stroke();
+    X.beginPath();X.moveTo(spx,spy-spSize);X.lineTo(spx,spy+spSize);X.stroke();
+    X.beginPath();X.moveTo(spx-spSize*0.6,spy-spSize*0.6);X.lineTo(spx+spSize*0.6,spy+spSize*0.6);X.stroke();
+    X.beginPath();X.moveTo(spx+spSize*0.6,spy-spSize*0.6);X.lineTo(spx-spSize*0.6,spy+spSize*0.6);X.stroke();
+    X.restore();
+  }
+}
+
+// ─── SCENE 2: MODULE 2 — TRACK ANALYSIS PIPELINE ───
+function scene2_tracks(t){
+  const ha=easeOut(Math.min(1,t*3));
+  
+  fadeText('Track Analysis Pipeline',W/2,50,32,'#f8fafc',ha,'center','700');
+  
+  // ── Top-left: Structural Track ──
+  if(t>0.05){
+    const sta=easeOut((t-0.05)*2.5);
+    drawGlass(60,90,W*0.3,H*0.42,16,sta,'rgba(6,182,212,0.2)','rgba(10,25,50,0.5)');
+    fadeText('Structural Track',60+W*0.15,120,20,'#67e8f9',sta,'center','700');
+    
+    // Fundus image (inside structural track)
+    drawCircleFundus(200,280,90,fundusImg,sta);
+    
+    // Detection list
+    const items=[{l:'Optic Disc',d:0.12},{l:'Fovea',d:0.16},{l:'Blood Vessels',d:0.2},{l:'Blood Vessels',d:0.24}];
+    items.forEach((item,i)=>{
+      const ia=easeOut((t-item.d)*3);
+      const iy=200+i*42;
+      X.save();X.globalAlpha=ia;X.strokeStyle='rgba(255,255,255,0.15)';X.lineWidth=1;X.setLineDash([3,3]);
+      X.beginPath();X.moveTo(290,280-40+i*28);X.lineTo(350,iy);X.stroke();X.setLineDash([]);X.restore();
+      fadeText(item.l,360,iy,15,'#94a3b8',ia,'left','500');
+    });
+    
+    // DR Severity Prediction bar chart
+    if(t>0.25){
+      const cha=easeOut((t-0.25)*2);
+      fadeText('DR Severity Prediction',250,380,14,'#94a3b8',cha);
+      const bars=[
+        {h:30,c:'#3b82f6'},{h:50,c:'#60a5fa'},{h:90,c:'#10b981'},
+        {h:120,c:'#f97316'},{h:150,c:'#10b981'},{h:80,c:'#f97316'},
+        {h:40,c:'#ef4444'}
+      ];
+      const bx=120,by=465,bw=28,bgap=8;
+      bars.forEach((b,i)=>{
+        const ba=easeOut((t-0.28-i*0.02)*3)*cha;
+        const bh=b.h*ba;
+        X.save();X.globalAlpha=cha;
+        X.fillStyle=b.c;X.fillRect(bx+i*(bw+bgap),by-bh,bw,bh);X.restore();
+      });
+      // Trend arrow
+      if(t>0.4){
+        const ara=easeOut((t-0.4)*3)*cha;
+        X.save();X.globalAlpha=ara;X.strokeStyle='#f97316';X.lineWidth=3;
+        X.beginPath();X.moveTo(bx,by-20);
+        X.quadraticCurveTo(bx+100,by-140,bx+bars.length*(bw+bgap),by-160);X.stroke();
+        // Arrow head
+        X.fillStyle='#f97316';X.beginPath();
+        X.moveTo(bx+bars.length*(bw+bgap),by-160);
+        X.lineTo(bx+bars.length*(bw+bgap)-12,by-150);
+        X.lineTo(bx+bars.length*(bw+bgap)-8,by-168);X.fill();
+        X.restore();
+      }
+    }
+  }
+  
+  // ── Bottom-left: Hybrid DL Track + EfficientNetB4 ──
+  if(t>0.15){
+    const hta=easeOut((t-0.15)*2.5);
+    drawGlass(60,H*0.55,W*0.35,H*0.4,16,hta,'rgba(99,102,241,0.15)','rgba(10,20,45,0.5)');
+    fadeText('Hybrid DL Track',60+W*0.175,H*0.55+30,20,'#818cf8',hta,'center','700');
+    
+    // Neural network visualization
+    const nnX=140,nnY=H*0.72,nnW=W*0.28;
+    const layers=[4,6,8,10,8,6,3];
+    layers.forEach((n,li)=>{
+      const lx=nnX+li*(nnW/6);
+      const la=easeOut((t-0.18-li*0.03)*3)*hta;
+      for(let ni=0;ni<n;ni++){
+        const ny=nnY-((n-1)*18)/2+ni*18;
+        X.save();X.globalAlpha=la;
+        X.fillStyle=`hsl(${220+li*8},75%,${60-ni*2}%)`;
+        X.shadowColor=X.fillStyle;X.shadowBlur=4;
+        X.beginPath();X.arc(lx,ny,5,0,7);X.fill();X.shadowBlur=0;
+        if(li<layers.length-1){
+          X.strokeStyle=`rgba(99,130,246,${0.12*la})`;X.lineWidth=0.7;
+          const nlx=nnX+(li+1)*(nnW/6);
+          const nn2=layers[li+1];
+          for(let nni=0;nni<nn2;nni+=2){
+            const targetY=nnY-((nn2-1)*18)/2+nni*18;
+            X.beginPath();X.moveTo(lx+5,ny);X.lineTo(nlx-5,targetY);X.stroke();
+          }
+        }
+        X.restore();
+      }
+    });
+    
+    // Fusion node (purple + orange)
+    if(t>0.4){
+      const fna=easeOut((t-0.4)*3)*hta;
+      const fnx=nnX+nnW+30,fny=nnY;
+      X.save();X.globalAlpha=fna;
+      X.fillStyle='#a855f7';X.shadowColor='#a855f7';X.shadowBlur=10;
+      X.beginPath();X.arc(fnx,fny,12,0,7);X.fill();X.shadowBlur=0;
+      X.fillStyle='#f97316';X.beginPath();X.arc(fnx+25,fny,10,0,7);X.fill();
+      X.restore();
+    }
+    
+    fadeText('EfficientNet-B4',nnX+nnW/2,H*0.95,16,'#818cf8',hta,'center','600');
+  }
+  
+  // ── Top-right: DR Severity chart (larger) ──
+  if(t>0.3){
+    const dra=easeOut((t-0.3)*2);
+    drawGlass(W*0.55,90,W*0.42,H*0.42,16,dra,'rgba(249,115,22,0.15)','rgba(15,25,45,0.5)');
+    
+    // Larger bar chart for DR severity
+    const drBars=[
+      {l:'Grade 0',h:0.3,c:'#3b82f6'},{l:'Grade 1',h:0.5,c:'#06b6d4'},
+      {l:'Grade 2',h:0.85,c:'#10b981'},{l:'Grade 3',h:1.0,c:'#f97316'},
+      {l:'Grade 4',h:0.6,c:'#ef4444'}
+    ];
+    const chartX=W*0.6,chartY=400,chartW=W*0.32,chartH=250;
+    fadeText('DR Severity Prediction',W*0.55+W*0.21,120,18,'#e2e8f0',dra,'center','700');
+    
+    drBars.forEach((b,i)=>{
+      const ba=easeOut((t-0.35-i*0.04)*2.5)*dra;
+      const bw2=chartW/drBars.length-12;
+      const bx2=chartX+i*(bw2+12);
+      const bh2=chartH*b.h*ba;
+      X.save();X.globalAlpha=dra;
+      const barGrd=X.createLinearGradient(bx2,chartY-bh2,bx2,chartY);
+      barGrd.addColorStop(0,b.c);barGrd.addColorStop(1,b.c+'66');
+      X.fillStyle=barGrd;roundRect(bx2,chartY-bh2,bw2,bh2,4);X.fill();
+      X.restore();
+      fadeText(b.l,bx2+bw2/2,chartY+20,11,'#64748b',dra*ba,'center','500');
+    });
+    
+    // Axis lines
+    X.save();X.globalAlpha=dra*0.3;X.strokeStyle='#475569';X.lineWidth=1;
+    X.beginPath();X.moveTo(chartX-10,chartY);X.lineTo(chartX+chartW,chartY);X.stroke();
+    X.beginPath();X.moveTo(chartX-10,chartY);X.lineTo(chartX-10,chartY-chartH-10);X.stroke();
+    X.restore();
+  }
+  
+  // ── Bottom-right: Model Interpretability preview ──
+  if(t>0.45){
+    const mia=easeOut((t-0.45)*2);
+    drawGlass(W*0.55,H*0.55,W*0.42,H*0.4,16,mia,'rgba(249,115,22,0.1)','rgba(15,20,40,0.5)');
+    fadeText('Module 3: Model Interpretability',W*0.55+W*0.21,H*0.55+30,18,'#f97316',mia,'center','700');
+    
+    // Grad-CAM preview
+    const gcx=W*0.7,gcy=H*0.77,gcr=90;
+    drawCircleFundus(gcx,gcy,gcr,fundusImg,mia);
+    // Heatmap overlay
+    if(mia>0.3){
+      X.save();X.globalAlpha=mia*0.6;
+      X.beginPath();X.arc(gcx,gcy,gcr,0,Math.PI*2);X.clip();
+      const hGrd=X.createRadialGradient(gcx+10,gcy-10,0,gcx,gcy,gcr);
+      hGrd.addColorStop(0,'rgba(239,68,68,0.7)');
+      hGrd.addColorStop(0.3,'rgba(245,158,11,0.5)');
+      hGrd.addColorStop(0.6,'rgba(251,191,36,0.3)');
+      hGrd.addColorStop(1,'rgba(6,182,212,0.1)');
+      X.globalCompositeOperation='screen';X.fillStyle=hGrd;
+      X.fillRect(gcx-gcr,gcy-gcr,gcr*2,gcr*2);
+      X.restore();
+    }
+    
+    // Calibration module label
+    if(t>0.6){
+      const cla=easeOut((t-0.6)*3);
+      drawGlass(W*0.82,H*0.62,150,35,10,cla,'rgba(6,182,212,0.3)','rgba(6,182,212,0.08)');
+      fadeText('Calibration',W*0.82+75,H*0.62+17,13,'#06b6d4',cla,'center','600');
+    }
+  }
+  
+  // Dashed connection lines between sections
+  if(t>0.5){
+    const da=easeOut((t-0.5)*2)*0.3;
+    X.save();X.globalAlpha=da;X.strokeStyle='rgba(255,255,255,0.2)';X.lineWidth=1.5;X.setLineDash([8,8]);
+    X.beginPath();X.moveTo(W*0.38,H*0.5);X.lineTo(W*0.55,H*0.5);X.stroke();
+    X.beginPath();X.moveTo(W*0.38,H*0.75);X.lineTo(W*0.55,H*0.75);X.stroke();
+    X.setLineDash([]);X.restore();
+  }
+}
+
+// ─── SCENE 3: MODULE 3 — MODEL INTERPRETABILITY & CALIBRATION ───
+function scene3_interpretability(t){
+  const ha=easeOut(Math.min(1,t*3));
+  
+  fadeText('Module 3: Model Interpretability & Calibration Flow',W/2,50,32,'#f8fafc',ha,'center','700');
+  
+  // ── Left side: Structural Track summary + Fundule Track ──
+  if(t>0.05){
+    const sta=easeOut((t-0.05)*2.5);
+    // Fundule Track label
+    drawGlass(80,100,260,45,12,sta,'rgba(6,182,212,0.3)','rgba(6,182,212,0.08)');
+    fadeText('Fundule: Track',210,122,16,'#67e8f9',sta,'center','700');
+    
+    // Structural Track panel
+    drawGlass(60,170,380,320,16,sta,'rgba(255,255,255,0.04)','rgba(10,20,40,0.5)');
+    fadeText('Structural Track',250,200,18,'#94a3b8',sta,'center','600');
+    
+    const trackItems=['Fovea','Blood Vessels','Blood Vessels'];
+    trackItems.forEach((item,i)=>{
+      const ia=easeOut((t-0.1-i*0.04)*3);
+      fadeText(item,120,240+i*35,15,'#cbd5e1',ia*sta,'left','500');
+      // Dashed lines
+      X.save();X.globalAlpha=ia*sta*0.3;X.strokeStyle='#475569';X.lineWidth=1;X.setLineDash([3,4]);
+      X.beginPath();X.moveTo(260,240+i*35);X.lineTo(380,240+i*35);X.stroke();X.setLineDash([]);X.restore();
+    });
+    
+    // DR Severity bar chart (mini)
+    if(t>0.2){
+      const cha=easeOut((t-0.2)*2.5)*sta;
+      fadeText('DR Severity Prediction',250,370,13,'#64748b',cha,'center','500');
+      const miniBars=[
+        {h:25,c:'#3b82f6'},{h:40,c:'#06b6d4'},{h:70,c:'#10b981'},
+        {h:100,c:'#f97316'},{h:130,c:'#10b981'},{h:60,c:'#f97316'},{h:30,c:'#ef4444'}
+      ];
+      miniBars.forEach((b,i)=>{
+        const ba=easeOut((t-0.22-i*0.01)*3)*cha;
+        const bh=b.h*0.7*ba;
+        X.save();X.globalAlpha=cha;X.fillStyle=b.c;
+        X.fillRect(100+i*35,460-bh,25,bh);X.restore();
+      });
+    }
+  }
+  
+  // ── Left bottom: EfficientNetB4 network ──
+  if(t>0.15){
+    const nna=easeOut((t-0.15)*2);
+    const nnCx=250,nnCy=700;
+    const layers=[4,6,8,10,8,5];
+    layers.forEach((n,li)=>{
+      const lx=100+li*65;
+      const la=easeOut((t-0.18-li*0.03)*3)*nna;
+      for(let ni=0;ni<n;ni++){
+        const ny=nnCy-((n-1)*16)/2+ni*16;
+        X.save();X.globalAlpha=la;
+        X.fillStyle=`hsl(${210+li*7},70%,${65-ni*2}%)`;
+        X.shadowColor=X.fillStyle;X.shadowBlur=4;
+        X.beginPath();X.arc(lx,ny,4.5,0,7);X.fill();X.shadowBlur=0;
+        if(li<layers.length-1){
+          X.strokeStyle=`rgba(59,130,246,${0.08*la})`;X.lineWidth=0.5;
+          const nlx=100+(li+1)*65;
+          for(let nni=0;nni<Math.min(layers[li+1],6);nni+=2){
+            const targetY=nnCy-((layers[li+1]-1)*16)/2+nni*16;
+            X.beginPath();X.moveTo(lx+4,ny);X.lineTo(nlx-4,targetY);X.stroke();
+          }
+        }
+        X.restore();
+      }
+    });
+    // Fusion dots
+    const lastLx=100+5*65+20;
+    X.save();X.globalAlpha=nna;
+    X.fillStyle='#a855f7';X.shadowColor='#a855f7';X.shadowBlur=6;
+    X.beginPath();X.arc(lastLx+10,nnCy,8,0,7);X.fill();
+    X.fillStyle='#f97316';X.beginPath();X.arc(lastLx+30,nnCy,6,0,7);X.fill();
+    X.shadowBlur=0;X.restore();
+    fadeText('EfficientNet-B4',250,nnCy+80,15,'#818cf8',nna,'center','600');
+    
+    // Connecting arrow to center (Grad-CAM)
+    if(t>0.3){
+      drawFlowArrow(440,nnCy-40,560,350,easeOut((t-0.3)*2)*0.4,'#f97316');
+    }
+  }
+  
+  // ── CENTER: Large Grad-CAM Heatmap ──
+  if(t>0.15){
+    const gca=easeOut((t-0.15)*2.5);
+    const gcx=W*0.5,gcy=350,gcr=180;
+    
+    // Orange "?" icon
+    X.save();X.globalAlpha=gca;
+    X.fillStyle='#f97316';X.beginPath();X.arc(gcx-gcr-30,gcy-gcr+20,18,0,7);X.fill();
+    fadeText('?',gcx-gcr-30,gcy-gcr+20,20,'#fff',gca,'center','800');
+    X.restore();
+    
+    // Glass panel behind heatmap
+    drawGlass(gcx-gcr-15,gcy-gcr-30,gcr*2+30,gcr*2+60,16,gca,'rgba(249,115,22,0.2)','rgba(20,10,5,0.4)');
+    
+    // Fundus base
+    drawCircleFundus(gcx,gcy,gcr,fundusImg,gca);
+    
+    // Grad-CAM heatmap overlay with animation
+    if(t>0.25){
+      const hma=easeOut((t-0.25)*2)*gca;
+      X.save();X.globalAlpha=hma*0.7;
+      X.beginPath();X.arc(gcx,gcy,gcr,0,Math.PI*2);X.clip();
+      
+      // Multi-center heatmap
+      const centers=[{x:gcx+20,y:gcy-15,r:gcr*0.7,c:'rgba(239,68,68,'},{x:gcx-30,y:gcy+20,r:gcr*0.4,c:'rgba(245,158,11,'}];
+      centers.forEach(c=>{
+        const hg=X.createRadialGradient(c.x,c.y,0,c.x,c.y,c.r);
+        hg.addColorStop(0,c.c+'0.8)');hg.addColorStop(0.4,c.c+'0.4)');
+        hg.addColorStop(0.7,'rgba(251,191,36,0.2)');hg.addColorStop(1,'rgba(6,182,212,0.05)');
+        X.globalCompositeOperation='screen';X.fillStyle=hg;
+        X.fillRect(gcx-gcr,gcy-gcr,gcr*2,gcr*2);
+      });
+      
+      // Pulsing bright spot
+      const pulse=Math.sin(frame*0.1)*0.15;
+      X.globalAlpha=hma*(0.4+pulse);
+      X.fillStyle='rgba(255,255,255,0.6)';
+      X.beginPath();X.arc(gcx+20,gcy-15,8,0,7);X.fill();
+      X.restore();
+    }
+  }
+  
+  // ── RIGHT-TOP: Feature Importance (SHAP) bar chart ──
+  if(t>0.35){
+    const sha=easeOut((t-0.35)*2.5);
+    drawGlass(W*0.72,90,W*0.25,340,16,sha,'rgba(255,255,255,0.05)','rgba(250,250,255,0.88)');
+    fadeText('Feature Importance',W*0.72+W*0.125,130,20,'#1e293b',sha,'center','700');
+    
+    // Vertical bars
+    const feats=[
+      {l:'Alt',h:0.95,c:'#3b82f6'},{l:'Dane',h:0.7,c:'#06b6d4'},{l:'Dniac',h:0.55,c:'#10b981'},
+      {l:'Finn',h:0.45,c:'#f97316'},{l:'Soale',h:0.35,c:'#fbbf24'},{l:'Soflar',h:0.25,c:'#ef4444'}
+    ];
+    const fbx=W*0.75,fby=380,fbw=30,fbgap=10;
+    feats.forEach((f,i)=>{
+      const fa=easeOut((t-0.38-i*0.03)*3)*sha;
+      const fh=200*f.h*fa;
+      const fx2=fbx+i*(fbw+fbgap);
+      X.save();X.globalAlpha=sha;X.fillStyle=f.c;
+      X.fillRect(fx2,fby-fh,fbw,fh);X.restore();
+      fadeText(f.l,fx2+fbw/2,fby+15,10,'#475569',sha*fa,'center','500');
+    });
+    // Y-axis labels
+    ['300','250','150','100','50','0'].forEach((v,i)=>{
+      fadeText(v,W*0.73,fby-200+i*40,10,'#64748b',sha*0.6,'right','400');
+    });
+    fadeText('(SHAP)',W*0.72+W*0.125,fby+40,14,'#475569',sha,'center','600');
+    
+    // Arrow from Grad-CAM to SHAP
+    drawFlowArrow(W*0.5+180+20,270,W*0.72,270,sha*0.4,'#f97316');
+  }
+  
+  // ── BOTTOM: Calibration Module ──
+  if(t>0.5){
+    const cala=easeOut((t-0.5)*2.5);
+    drawGlass(W*0.35,H*0.6,W*0.55,H*0.35,16,cala,'rgba(6,182,212,0.15)','rgba(10,20,40,0.6)');
+    fadeText('Calibration Module',W*0.35+W*0.275,H*0.6+30,20,'#e2e8f0',cala,'center','700');
+    
+    // Mini histogram
+    if(t>0.55){
+      const hista=easeOut((t-0.55)*3)*cala;
+      const histBars=[20,40,60,80,100,120,140,180,250,300,200,130,80,40,20];
+      histBars.forEach((h,i)=>{
+        const ba=easeOut((t-0.56-i*0.005)*4)*hista;
+        const bh=h*0.3*ba;
+        const colors2=['#3b82f6','#06b6d4','#10b981','#f97316','#ef4444'];
+        X.save();X.globalAlpha=hista;X.fillStyle=colors2[Math.floor(i/3)%5];
+        X.fillRect(W*0.38+i*18,H*0.92-bh,14,bh);X.restore();
+      });
+    }
+    
+    // Temperature Scaling thermometers
+    if(t>0.6){
+      const ta=easeOut((t-0.6)*3)*cala;
+      fadeText('Temperature Scaling',W*0.58,H*0.68,15,'#94a3b8',ta,'center','500');
+      
+      // Thermometer 1 (hot - orange)
+      const t1x=W*0.57,t1y=H*0.75;
+      X.save();X.globalAlpha=ta;
+      X.strokeStyle='rgba(255,255,255,0.3)';X.lineWidth=2;
+      roundRect(t1x,t1y,16,80,8);X.stroke();
+      const fillH1=60*easeOut((t-0.63)*2);
+      X.fillStyle='#f97316';X.fillRect(t1x+2,t1y+80-fillH1-2,12,fillH1);
+      X.fillStyle='#f97316';X.beginPath();X.arc(t1x+8,t1y+90,12,0,7);X.fill();
+      X.restore();
+      fadeText('Crude',t1x+8,t1y+115,11,'#94a3b8',ta,'center','400');
+      
+      // Lightning bolt
+      fadeText('⚡',W*0.6,H*0.79,28,'#fbbf24',ta*easeOut((t-0.65)*3),'center','400');
+      
+      // Thermometer 2 (cool - cyan)
+      const t2x=W*0.64,t2y=H*0.75;
+      X.save();X.globalAlpha=ta;
+      X.strokeStyle='rgba(255,255,255,0.3)';X.lineWidth=2;
+      roundRect(t2x,t2y,16,80,8);X.stroke();
+      const fillH2=35*easeOut((t-0.66)*2);
+      X.fillStyle='#06b6d4';X.fillRect(t2x+2,t2y+80-fillH2-2,12,fillH2);
+      X.fillStyle='#06b6d4';X.beginPath();X.arc(t2x+8,t2y+90,12,0,7);X.fill();
+      X.restore();
+      fadeText('Crome',t2x+8,t2y+115,11,'#94a3b8',ta,'center','400');
+      
+      // Arrow between thermometers
+      drawFlowArrow(W*0.67,H*0.79,W*0.72,H*0.79,ta*0.5,'#06b6d4');
+    }
+    
+    // Calibrated Confidence Score badge
+    if(t>0.7){
+      const bda=easeOut((t-0.7)*3)*cala;
+      const bdx=W*0.76,bdy=H*0.72;
+      
+      // Shield shape
+      X.save();X.globalAlpha=bda;
+      X.fillStyle='rgba(6,80,140,0.6)';X.strokeStyle='#06b6d4';X.lineWidth=2;
+      X.beginPath();X.moveTo(bdx,bdy-40);X.lineTo(bdx+35,bdy-25);X.lineTo(bdx+35,bdy+10);
+      X.quadraticCurveTo(bdx+35,bdy+35,bdx,bdy+45);
+      X.quadraticCurveTo(bdx-35,bdy+35,bdx-35,bdy+10);X.lineTo(bdx-35,bdy-25);X.closePath();
+      X.fill();X.stroke();
+      
+      // Checkmark
+      X.strokeStyle='#10b981';X.lineWidth=4;X.lineCap='round';
+      X.beginPath();X.moveTo(bdx-12,bdy);X.lineTo(bdx-2,bdy+10);X.lineTo(bdx+15,bdy-10);X.stroke();
+      X.restore();
+      
+      fadeText('Calibrated',bdx+50,bdy-15,14,'#e2e8f0',bda,'left','600');
+      fadeText('Confidence Score',bdx+50,bdy+5,14,'#e2e8f0',bda,'left','600');
+      
+      // Animated percentage
+      const confVal=Math.floor(easeOut((t-0.75)*2)*87);
+      fadeText(`${confVal}%`,bdx+50,bdy+35,28,'#06b6d4',bda,'left','800');
+      
+      // Signal bars
+      for(let i=0;i<4;i++){
+        X.save();X.globalAlpha=bda*(i<3?1:0.3);
+        X.fillStyle='#06b6d4';
+        X.fillRect(bdx+130+i*10,bdy+42-i*8,6,8+i*8);
+        X.restore();
+      }
+    }
+  }
+}
+
+// ─── SCENE 4: MODULE 4 — SIMULINK + CLINICAL REPORT ───
+function scene4_simulink(t){
+  const ha=easeOut(Math.min(1,t*3));
+  
+  fadeText('Module 4: Operational Optimization Stream (Simulink)',W/2,35,28,'#f8fafc',ha,'center','700');
+  
+  // ── MATLAB-style sidebar ──
+  if(t>0.03){
+    const sba=easeOut((t-0.03)*3);
+    // MATLAB logo area
+    X.save();X.globalAlpha=sba;
+    X.fillStyle='rgba(15,25,50,0.9)';X.fillRect(60,60,60,H-120);
+    X.strokeStyle='rgba(255,255,255,0.05)';X.lineWidth=1;
+    X.strokeRect(60,60,60,H-120);
+    X.restore();
+    
+    // MATLAB icon (orange triangle)
+    X.save();X.globalAlpha=sba;
+    X.fillStyle='#f97316';X.beginPath();
+    X.moveTo(80,80);X.lineTo(105,95);X.lineTo(85,110);X.closePath();X.fill();
+    X.restore();
+    
+    // Sidebar icons
+    const icons=['⊞','🔍','📋','📐','⚙'];
+    icons.forEach((ic,i)=>{
+      fadeText(ic,90,155+i*50,18,'#475569',sba*0.5,'center','400');
+    });
+    
+    // Top tabs
+    drawGlass(130,60,W*0.5,35,0,sba*0.3,'rgba(255,255,255,0.05)','rgba(20,30,55,0.8)');
+    fadeText('Thermal Model ×',230,77,13,'#e2e8f0',sba,'center','600');
+    fadeText('Animations',370,77,13,'#64748b',sba*0.6,'center','400');
+    fadeText('Paired Sensors',500,77,13,'#64748b',sba*0.6,'center','400');
+  }
+  
+  // ── GPU Throughput Chart ──
+  if(t>0.08){
+    const cha=easeOut((t-0.08)*2.5);
+    drawGlass(140,105,W*0.32,H*0.38,12,cha,'rgba(255,255,255,0.04)','rgba(10,20,40,0.7)');
+    fadeText('GPU Throughput',280,130,16,'#e2e8f0',cha,'center','700');
+    
+    const cx=180,cy=355,cw=W*0.27,ch=180;
+    // Grid
+    X.save();X.globalAlpha=cha*0.2;X.strokeStyle='#334155';X.lineWidth=0.5;
+    for(let g=0;g<5;g++){X.beginPath();X.moveTo(cx,cy-g*(ch/4));X.lineTo(cx+cw,cy-g*(ch/4));X.stroke();}
+    X.restore();
+    // Y-axis labels
+    ['100','80','60','40','20','0'].forEach((v,i)=>fadeText(v,cx-20,cy-i*(ch/5),10,'#475569',cha*0.5,'right','400'));
+    // X-axis labels
+    ['0','200','1000','2000','3000'].forEach((v,i)=>fadeText(v,cx+i*(cw/4),cy+18,10,'#475569',cha*0.5,'center','400'));
+    
+    // Lines (3 series)
+    const series=[
+      {c:'#10b981',offset:0},{c:'#f97316',offset:15},{c:'#fbbf24',offset:8}
+    ];
+    series.forEach((s,si)=>{
+      const pts=30;const drawn=Math.floor(easeOut((t-0.12-si*0.03)*2)*pts);
+      if(drawn<2)return;
+      X.save();X.globalAlpha=cha;X.strokeStyle=s.c;X.lineWidth=2;X.beginPath();
+      for(let p=0;p<drawn;p++){
+        const px2=cx+(p/(pts-1))*cw;
+        const val=(20+s.offset+p*2+Math.sin(p*0.8+si)*8)/100;
+        const py2=cy-val*ch;
+        p===0?X.moveTo(px2,py2):X.lineTo(px2,py2);
+      }
+      X.stroke();X.restore();
+    });
+  }
+  
+  // ── Network Bandwidth Chart ──
+  if(t>0.15){
+    const nba=easeOut((t-0.15)*2.5);
+    drawGlass(140,H*0.5+10,W*0.32,H*0.38,12,nba,'rgba(255,255,255,0.04)','rgba(10,20,40,0.7)');
+    fadeText('Network Bandwidth',300,H*0.5+40,16,'#e2e8f0',nba,'center','700');
+    
+    const nx=180,ny=H*0.87,nw=W*0.27,nh=160;
+    // Legend
+    X.save();X.globalAlpha=nba;
+    X.fillStyle='#10b981';X.fillRect(nx+nw*0.4,H*0.5+55,12,3);
+    fadeText('Census',nx+nw*0.4+40,H*0.5+57,11,'#10b981',nba,'center','500');
+    X.fillStyle='#f97316';X.fillRect(nx+nw*0.6,H*0.5+55,12,3);
+    fadeText('Secum',nx+nw*0.6+38,H*0.5+57,11,'#f97316',nba,'center','500');
+    X.restore();
+    
+    // Y-axis
+    ['100','80','60','40','20','0'].forEach((v,i)=>fadeText(v,nx-20,ny-i*(nh/5),10,'#475569',nba*0.5,'right','400'));
+    ['0','500','1000','2000','3000'].forEach((v,i)=>fadeText(v,nx+i*(nw/4),ny+18,10,'#475569',nba*0.5,'center','400'));
+    
+    // Area chart
+    const pts2=30;const drawn2=Math.floor(easeOut((t-0.2)*2)*pts2);
+    if(drawn2>1){
+      X.save();X.globalAlpha=nba*0.3;
+      X.fillStyle='rgba(59,130,246,0.3)';X.beginPath();X.moveTo(nx,ny);
+      for(let p=0;p<drawn2;p++){
+        const px2=nx+(p/(pts2-1))*nw;
+        const val=(30+Math.sin(p*0.5)*15+p*1.5)/100;
+        X.lineTo(px2,ny-val*nh);
+      }
+      X.lineTo(nx+((drawn2-1)/(pts2-1))*nw,ny);X.fill();X.restore();
+      
+      X.save();X.globalAlpha=nba;X.strokeStyle='#3b82f6';X.lineWidth=2;X.beginPath();
+      for(let p=0;p<drawn2;p++){
+        const px2=nx+(p/(pts2-1))*nw;
+        const val=(30+Math.sin(p*0.5)*15+p*1.5)/100;
+        p===0?X.moveTo(px2,ny-val*nh):X.lineTo(px2,ny-val*nh);
+      }
+      X.stroke();X.restore();
+    }
+  }
+  
+  // ── Simulink Model (vertical state machine) ──
+  if(t>0.2){
+    const sma=easeOut((t-0.2)*2.5);
+    drawGlass(W*0.42,105,W*0.2,H*0.85,12,sma,'rgba(255,255,255,0.04)','rgba(10,20,40,0.6)');
+    fadeText('Simulink Model',W*0.42+W*0.1,130,16,'#e2e8f0',sma,'center','700');
+    
+    // State machine nodes
+    const states=[
+      {l:'Simulink Model',c:'#a855f7',y:180},{l:'Capture',c:'#06b6d4',y:300},
+      {l:'Focus',c:'#f97316',y:440},{l:'Run',c:'#ef4444',y:580},{l:'Discrete Model',c:'#3b82f6',y:720}
+    ];
+    const smx=W*0.42+W*0.1;
+    states.forEach((s,i)=>{
+      const sa=easeOut((t-0.22-i*0.04)*3)*sma;
+      // Node circle
+      X.save();X.globalAlpha=sa;
+      X.fillStyle=s.c;X.shadowColor=s.c;X.shadowBlur=8;
+      X.beginPath();X.arc(smx,s.y,16,0,7);X.fill();X.shadowBlur=0;
+      X.restore();
+      fadeText(s.l,smx,s.y+35,12,'#94a3b8',sa,'center','500');
+      
+      // Connecting lines
+      if(i<states.length-1){
+        X.save();X.globalAlpha=sa*0.4;X.strokeStyle='rgba(255,255,255,0.3)';X.lineWidth=2;
+        X.beginPath();X.moveTo(smx,s.y+16);X.lineTo(smx,states[i+1].y-16);X.stroke();
+        // Arrow
+        X.fillStyle='rgba(255,255,255,0.3)';X.beginPath();
+        X.moveTo(smx-5,states[i+1].y-20);X.lineTo(smx+5,states[i+1].y-20);
+        X.lineTo(smx,states[i+1].y-14);X.fill();
+        X.restore();
+      }
+    });
+    
+    // Play button (between Capture and Focus)
+    if(t>0.35){
+      const pba=easeOut((t-0.35)*3)*sma;
+      X.save();X.globalAlpha=pba;
+      drawGlass(smx-40,states[1].y+50,80,50,10,1,'rgba(255,255,255,0.1)','rgba(30,40,60,0.8)');
+      X.fillStyle='#e2e8f0';X.beginPath();
+      X.moveTo(smx-8,states[1].y+65);X.lineTo(smx-8,states[1].y+88);
+      X.lineTo(smx+12,states[1].y+76);X.fill();
+      X.restore();
+    }
+  }
+  
+  // ── Clinical Report (overlaid, right side) ──
+  if(t>0.4){
+    const rpa=easeOut((t-0.4)*2);
+    const rx=W*0.58,ry=80,rw=W*0.38,rh=H*0.88;
+    
+    // Clipboard top
+    X.save();X.globalAlpha=rpa;
+    X.fillStyle='#475569';roundRect(rx+rw/2-40,ry-15,80,30,8);X.fill();
+    X.fillStyle='#64748b';roundRect(rx+rw/2-25,ry-8,50,16,4);X.fill();
+    X.restore();
+    
+    // Report body (white-ish)
+    drawGlass(rx,ry,rw,rh,16,rpa,'rgba(255,255,255,0.1)','rgba(240,245,255,0.92)');
+    
+    // Shadow effect
+    X.save();X.globalAlpha=rpa*0.15;
+    X.fillStyle='#000';roundRect(rx+5,ry+5,rw,rh,16);X.fill();X.restore();
+    
+    // Report title
+    fadeText('Clinical Report',rx+rw/2,ry+45,24,'#1e293b',rpa,'center','800');
+    
+    // Separator line
+    X.save();X.globalAlpha=rpa*0.3;X.strokeStyle='#cbd5e1';X.lineWidth=1;
+    X.beginPath();X.moveTo(rx+30,ry+65);X.lineTo(rx+rw-30,ry+65);X.stroke();X.restore();
+    
+    // Fundus thumbnail
+    if(t>0.45){
+      const fta=easeOut((t-0.45)*3)*rpa;
+      const ftx=rx+50,fty=ry+90,fts=110;
+      if(fundusImg.complete){
+        X.save();X.globalAlpha=fta;
+        roundRect(ftx,fty,fts,fts,8);X.clip();
+        X.drawImage(fundusImg,ftx,fty,fts,fts);
+        X.restore();
+        X.save();X.globalAlpha=fta*0.5;X.strokeStyle='#94a3b8';X.lineWidth=1;
+        roundRect(ftx,fty,fts,fts,8);X.stroke();X.restore();
+      }
+      
+      // Report fields
+      const fields=[
+        {l:'Doctor Function',v:'102/0094 POO',y:ry+100},
+        {l:'Accountability Grade',v:'',y:ry+130},
+        {l:'Layem Dare',v:'1 02/14',y:ry+155},
+        {l:'Dode',v:'Clinical Level',y:ry+185}
+      ];
+      fields.forEach((f,i)=>{
+        const fa2=easeOut((t-0.48-i*0.02)*3)*fta;
+        fadeText(f.l,rx+180,f.y,13,'#475569',fa2,'left','500');
+        if(f.v){
+          drawGlass(rx+rw*0.55,f.y-12,rw*0.35,24,4,fa2,'rgba(148,163,184,0.3)','rgba(255,255,255,0.5)');
+          fadeText(f.v,rx+rw*0.55+rw*0.175,f.y,11,'#1e293b',fa2,'center','600');
+        }
+      });
+    }
+    
+    // DR Severity Grade
+    if(t>0.55){
+      const dga=easeOut((t-0.55)*3)*rpa;
+      fadeText('DR Severity Grade:',rx+50,ry+240,14,'#1e293b',dga,'left','600');
+      drawGlass(rx+200,ry+228,40,24,4,dga,'rgba(148,163,184,0.3)','rgba(255,255,255,0.5)');
+      fadeText('4',rx+220,ry+240,14,'#1e293b',dga,'center','700');
+      
+      fadeText('SHAP Reliable:',rx+280,ry+240,14,'#1e293b',dga,'left','600');
+      // Checkboxes
+      for(let i=0;i<4;i++){
+        X.save();X.globalAlpha=dga;
+        X.strokeStyle=i<2?'#10b981':'#cbd5e1';X.lineWidth=1.5;
+        roundRect(rx+390+i*24,ry+230,18,18,3);X.stroke();
+        if(i<2){X.fillStyle='#10b981';fadeText('✓',rx+399+i*24,ry+240,12,'#10b981',dga,'center','700');}
+        X.restore();
+      }
+    }
+    
+    // Checkmark rows
+    if(t>0.6){
+      const cra=easeOut((t-0.6)*3)*rpa;
+      const checkRows=['Severity Risse:','DR Enseen Rectors:'];
+      checkRows.forEach((cr,i)=>{
+        const cy2=ry+280+i*35;
+        X.save();X.globalAlpha=cra;
+        X.fillStyle='#10b981';X.beginPath();X.arc(rx+50,cy2,9,0,7);X.fill();
+        fadeText('✓',rx+50,cy2,11,'#fff',cra,'center','700');
+        X.restore();
+        fadeText(cr,rx+70,cy2,13,'#1e293b',cra,'left','500');
+        for(let j=0;j<5;j++){
+          X.save();X.globalAlpha=cra;
+          X.strokeStyle=j<2?'#10b981':'#cbd5e1';X.lineWidth=1.5;
+          roundRect(rx+220+j*24,cy2-9,18,18,3);X.stroke();
+          if(j<2)fadeText('✓',rx+229+j*24,cy2,11,'#10b981',cra,'center','700');
+          X.restore();
+        }
+      });
+    }
+    
+    // Recommendations
+    if(t>0.65){
+      const reca=easeOut((t-0.65)*3)*rpa;
+      fadeText('Recommendations',rx+50,ry+370,15,'#1e293b',reca,'left','700');
+      X.save();X.globalAlpha=reca*0.3;X.strokeStyle='#94a3b8';X.lineWidth=1;
+      roundRect(rx+40,ry+385,rw-80,55,8);X.stroke();X.restore();
+      fadeText('Procentline aculire to do presenolance finances and',rx+55,ry+405,11,'#475569',reca,'left','400');
+      fadeText('pontitos and accemmet recommendation.',rx+55,ry+420,11,'#475569',reca,'left','400');
+    }
+    
+    // Doctor signature
+    if(t>0.7){
+      const siga=easeOut((t-0.7)*3)*rpa;
+      fadeText('Support Signature',rx+50,ry+470,13,'#1e293b',siga,'left','600');
+      // Cursive signature
+      X.save();X.globalAlpha=siga;X.strokeStyle='#1e3a5f';X.lineWidth=2;X.lineCap='round';
+      X.beginPath();
+      X.moveTo(rx+250,ry+480);
+      X.quadraticCurveTo(rx+280,ry+460,rx+310,ry+475);
+      X.quadraticCurveTo(rx+340,ry+490,rx+370,ry+465);
+      X.quadraticCurveTo(rx+390,ry+450,rx+410,ry+470);
+      X.stroke();X.restore();
+      fadeText('Signature',rx+330,ry+500,11,'#64748b',siga,'center','400');
+    }
+    
+    // Final Diagnosis button
+    if(t>0.75){
+      const btna=easeOut((t-0.75)*3)*rpa;
+      const btnx=rx+40,btny=ry+rh-70,btnw=rw-80,btnh=45;
+      X.save();X.globalAlpha=btna;
+      const btnGrd=X.createLinearGradient(btnx,btny,btnx+btnw,btny);
+      btnGrd.addColorStop(0,'#10b981');btnGrd.addColorStop(1,'#059669');
+      X.fillStyle=btnGrd;roundRect(btnx,btny,btnw,btnh,10);X.fill();
+      X.restore();
+      fadeText('Final Diagnosis & Treatment Plan',rx+rw/2,btny+btnh/2,16,'#ffffff',btna,'center','700');
+    }
+    
+    // Close button (X)
+    if(t>0.5){
+      const xa=rpa*0.6;
+      fadeText('✕',rx+rw-25,ry+25,18,'#94a3b8',xa,'center','400');
+    }
+    
+    // Confidence ring (behind report, partially visible)
+    if(t>0.55){
+      const cra=easeOut((t-0.55)*2)*rpa*0.4;
+      X.save();X.globalAlpha=cra;
+      X.strokeStyle='rgba(6,182,212,0.3)';X.lineWidth=10;
+      X.beginPath();X.arc(rx+rw+30,ry+80,60,-Math.PI/2,-Math.PI/2+0.25*Math.PI*2);X.stroke();
+      X.strokeStyle='rgba(255,255,255,0.05)';X.beginPath();X.arc(rx+rw+30,ry+80,60,0,Math.PI*2);X.stroke();
+      X.restore();
+      fadeText('25%',rx+rw+30,ry+80,18,'#06b6d4',cra,'center','800');
+    }
+  }
+}
+
+// ─── SCENE 5: CLOSING ───
+function scene5_closing(t){
+  // Ambient orbs
+  for(let i=0;i<6;i++){
+    const px=Math.sin(frame*0.004+i*1.2)*W*0.3+W/2;
+    const py=Math.cos(frame*0.006+i*0.8)*H*0.2+H/2;
+    drawGlow(px,py,300+Math.sin(frame*0.01+i)*50,'rgb(6,182,212)',0.08);
+  }
+  
+  const ea=easeOut(Math.min(1,t*2));
+  fadeText('RetinaAI Pro',W/2,H*0.32,64,'#f8fafc',ea,'center','700');
+  fadeText('Saving Sight. Saving Lives.',W/2,H*0.32+55,28,'#06b6d4',ea,'center','500');
+  
+  if(t>0.15){
+    const sa=easeOut((t-0.15)*2);
+    fadeText('End-to-end AI-powered screening for rural India',W/2,H*0.52,20,'#94a3b8',sa,'center','400');
+  }
+  
+  if(t>0.25){
+    const ba=easeOut((t-0.25)*2);
+    const stats=[{v:'94.8%',l:'Accuracy'},{v:'0.925',l:'Cohen κ'},{v:'148ms',l:'Inference'},{v:'100K+',l:'Patients/yr'}];
+    stats.forEach((s,i)=>{
+      const sx=W/2+(i-1.5)*200;const sy=H*0.65;
+      drawGlass(sx-80,sy-30,160,75,14,ba);
+      fadeText(s.v,sx,sy-2,28,'#06b6d4',ba,'center','800');
+      fadeText(s.l,sx,sy+28,14,'#94a3b8',ba,'center','600');
+    });
+  }
+  
+  if(t>0.4){
+    const la=easeOut((t-0.4)*2);
+    fadeText('SIH 2026 · MathWorks Challenge',W/2,H*0.85,18,'#475569',la,'center','600');
+  }
+  
+  // Expanding rings
+  const rA=Math.max(0,1-(frame%120)/120);
+  X.save();X.strokeStyle=`rgba(6,182,212,${rA*0.12})`;X.lineWidth=2;
+  X.beginPath();X.arc(W/2,H*0.38,(frame%120)*5,0,Math.PI*2);X.stroke();X.restore();
+}
+
+// ─── ENGINE ───
+const scenes=[scene0_doctor,scene1_acquisition,scene2_tracks,scene3_interpretability,scene4_simulink,scene5_closing];
+
+// Transition system
+const transitionCanvas=document.createElement('canvas');
+transitionCanvas.width=W;transitionCanvas.height=H;
+const tX=transitionCanvas.getContext('2d');
+let isTransitioning=false,transitionTime=0;
+const TRANSITION_DUR=30;
+
+function render(){
+  frame++;sceneFrame++;
+  
+  const currentDur=sceneDurations[Math.min(scene,sceneDurations.length-1)]||300;
+  if(sceneFrame>=currentDur&&scene<scenes.length-1){
+    tX.clearRect(0,0,W,H);tX.drawImage(C,0,0);
+    scene++;sceneFrame=0;
+    isTransitioning=true;transitionTime=0;
+  }
+  
+  X.clearRect(0,0,W,H);
+  drawBg();
+  
+  const dur=sceneDurations[Math.min(scene,sceneDurations.length-1)]||300;
+  const t=sceneFrame/dur;
+  
+  try{if(scenes[scene])scenes[scene](t);}catch(e){console.error('Scene error:',e);}
+  
+  // Transition overlay
+  if(isTransitioning){
+    transitionTime++;
+    const p=transitionTime/TRANSITION_DUR;
+    const e2=easeOut(p);
+    X.save();X.globalAlpha=1-e2;X.drawImage(transitionCanvas,0,0);X.restore();
+    if(transitionTime>=TRANSITION_DUR)isTransitioning=false;
+  }
+  
+  // Progress bar
+  let totalElapsed=0;
+  for(let s=0;s<scene;s++)totalElapsed+=sceneDurations[s];
+  totalElapsed+=sceneFrame;
+  const prog=totalElapsed/totalFrames;
+  X.fillStyle='rgba(6,182,212,0.8)';
+  X.fillRect(0,H-4,W*prog,4);
+  
+  // Status
+  document.getElementById('status').textContent=`Recording... Scene ${scene+1}/${scenes.length} | Frame ${totalElapsed}/${totalFrames} | ${Math.floor(prog*100)}%`;
+  
+  if(scene>=scenes.length-1&&sceneFrame>=sceneDurations[scenes.length-1]){
+    stopRecording();
+    return;
+  }
+  
+  requestAnimationFrame(render);
+}
+
+function startGeneration(){
+  document.getElementById('status').textContent='Starting recording...';
+  
+  // Start MediaRecorder
+  const stream=C.captureStream(60);
+  recorder=new MediaRecorder(stream,{mimeType:'video/webm;codecs=vp9',videoBitsPerSecond:8000000});
+  chunks=[];
+  recorder.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
+  recorder.onstop=()=>{
+    const blob=new Blob(chunks,{type:'video/webm'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='retina_ai_demo.webm';
+    document.body.appendChild(a);a.click();
+    document.getElementById('status').textContent='✅ Recording complete! WebM downloaded. Converting to MP4...';
+  };
+  recorder.start();
+  recording=true;
+  
+  requestAnimationFrame(render);
+}
+
+function stopRecording(){
+  if(recorder&&recorder.state==='recording'){
+    recorder.stop();
+  }
+  document.getElementById('status').textContent='✅ Done! Video saved.';
+}
+
+// Fallback if images don't load
+setTimeout(()=>{if(loadedCount<totalImages)startGeneration();},5000);
+</script>
+</body>
+</html>
