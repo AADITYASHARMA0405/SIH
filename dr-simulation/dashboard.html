@@ -1048,22 +1048,24 @@ function runSimulink() {
     for(let i=1;i<5;i++){ ctx.beginPath(); ctx.moveTo(0, i*60); ctx.lineTo(cv.width, i*60); ctx.stroke(); }
     
     if(hist.length > 1) {
+      const getX = (i) => cv.width - ((hist.length - 1 - i) / 49) * cv.width;
+      
       const grad = ctx.createLinearGradient(0,0,0,cv.height);
       grad.addColorStop(0, 'rgba(37, 99, 235, 0.15)'); grad.addColorStop(1, 'rgba(37, 99, 235, 0)');
       ctx.fillStyle = grad;
-      ctx.beginPath(); ctx.moveTo(0, cv.height);
-      hist.forEach((v, i) => ctx.lineTo((i/(50-1))*cv.width, cv.height - (v/300)*cv.height));
-      ctx.lineTo(cv.width, cv.height); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(getX(0), cv.height);
+      hist.forEach((v, i) => ctx.lineTo(getX(i), cv.height - (v/300)*cv.height));
+      ctx.lineTo(getX(hist.length-1), cv.height); ctx.fill();
       
       ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2.5; ctx.shadowColor = 'rgba(37, 99, 235, 0.2)'; ctx.shadowBlur = 4;
       ctx.beginPath();
       hist.forEach((v, i) => {
-        const x = (i/(50-1))*cv.width; const y = cv.height - (v/300)*cv.height;
+        const x = getX(i); const y = cv.height - (v/300)*cv.height;
         i===0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
       });
       ctx.stroke(); ctx.shadowBlur = 0;
       
-      const lastX = cv.width, lastY = cv.height - (hist[hist.length-1]/300)*cv.height;
+      const lastX = getX(hist.length-1), lastY = cv.height - (hist[hist.length-1]/300)*cv.height;
       ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(lastX, lastY, 4, 0, 7); ctx.fill();
       ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2; ctx.stroke();
       ctx.fillStyle = `rgba(37, 99, 235, ${Math.abs(Math.sin(tick*0.5))*0.4})`;
